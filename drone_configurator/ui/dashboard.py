@@ -107,7 +107,7 @@ class DashboardPage(QWidget):
         self.roll_tile = MetricTile("Roll", "deg")
         self.pitch_tile = MetricTile("Pitch", "deg")
         self.yaw_tile = MetricTile("Yaw Rate", "deg/s")
-        self.bat_tile = MetricTile("Battery", "V")
+        self.bat_tile = MetricTile("Battery", "")
         self.hz_tile = MetricTile("Loop Rate", "Hz")
         self.ram_tile = MetricTile("Free SRAM", "B")
 
@@ -196,7 +196,11 @@ class DashboardPage(QWidget):
         self.roll_tile.set_value(f"{imu.roll:+.1f}")
         self.pitch_tile.set_value(f"{imu.pitch:+.1f}")
         self.yaw_tile.set_value(f"{imu.yaw_rate:+.1f}")
-        self.bat_tile.set_value(f"{status.battery_v:.2f}" if status.battery_v is not None else "N/A")
+        if status.battery_v is not None:
+            pct, color = self._estimate_lipo_pct(status.battery_v)
+            self.bat_tile.set_value(f"{status.battery_v:.2f} V ({pct}%)", color)
+        else:
+            self.bat_tile.set_value("N/A")
         self.hz_tile.set_value(str(status.loop_hz) if status.loop_hz else "--")
         self.ram_tile.set_value(str(status.free_ram_bytes) if status.free_ram_bytes else "--")
         self.horizon.set_attitude(imu.roll, imu.pitch)
@@ -207,6 +211,17 @@ class DashboardPage(QWidget):
         else:
             self.warnings_label.setText("All monitored subsystems nominal.")
             self.warnings_label.setStyleSheet(f"color: {PALETTE['success']}; font-weight: 500;")
+
+    @staticmethod
+    def _estimate_lipo_pct(voltage: float) -> tuple[int, str]:
+        """Auto-detect LiPo cell count (1S-4S) and return (percent, hex_color)."""
+        if voltage < 1.0:
+            return 0, PALETTE["text_secondary"]
+        cells = max(1, round(voltage / 3.85))
+        per_cell = voltage / cells
+        pct = int(max(0.0, min(100.0, ((per_cell - 3.50) / (4.20 - 3.50)) * 100.0)))
+        color = PALETTE["success"] if pct > 30 else (PALETTE["warning"] if pct > 15 else PALETTE["danger"])
+        return pct, color
 
     def append_log(self, level: str, message: str) -> None:
         self.log_box.append(f"[{level}] {message}")

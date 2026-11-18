@@ -194,7 +194,12 @@ class _SerialWorker(QThread):
 
     def _write_bytes(self, frame: bytes) -> None:
         if self._serial is not None and self._serial.is_open:
-            self._serial.write(frame)
+            # Chunk writes in 32-byte slices so ATmega328P's 64-byte UART RX buffer never overflows
+            chunk_size = 32
+            for i in range(0, len(frame), chunk_size):
+                self._serial.write(frame[i : i + chunk_size])
+                if i + chunk_size < len(frame):
+                    time.sleep(0.005)
 
     def _check_timeouts(self) -> None:
         now = time.monotonic()
@@ -284,6 +289,7 @@ class SerialManager(QObject):
         self._worker.connected_signal.connect(self._on_connected)
         self._worker.disconnected_signal.connect(self._on_disconnected)
         self._worker.connection_lost_signal.connect(self._on_connection_lost)
+        self._worker.command_ack_signal.connect(self._on_command_ack_internal)
         self._worker.command_ack_signal.connect(self.command_succeeded)
         self._worker.command_err_signal.connect(self.command_failed)
         self._worker.telemetry_signal.connect(self.telemetry_received)
@@ -324,9 +330,12 @@ class SerialManager(QObject):
     def _on_connected(self, info: dict[str, Any]) -> None:
         self._is_connected = True
         self.connected.emit(info)
-        # Immediately fetch current FC configuration and enable telemetry stream after handshake
+        # Fetch current FC configuration first; enable telemetry stream once get_config ACKs
         self.send_command(CommandType.GET_CONFIG)
-        self.send_command(CommandType.SET_STREAM, {"enabled": True, "rate_hz": 20})
+
+    def _on_command_ack_internal(self, cmd: str, _data: dict[str, Any]) -> None:
+        if cmd == CommandType.GET_CONFIG.value and self._is_connected:
+            self.send_command(CommandType.SET_STREAM, {"enabled": True, "rate_hz": 20})
 
     def _on_disconnected(self) -> None:
         self._is_connected = False

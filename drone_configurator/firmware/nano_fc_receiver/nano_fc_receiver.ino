@@ -1,18 +1,18 @@
 /*
  * NanoFC Quad-X Receiver & Flight Controller Firmware
  * Target: Classic Arduino Nano (ATmega328P, 5V, 16 MHz)
- * Required Libraries: ArduinoJson (v6/v7), Servo, Wire, EEPROM (+ RF24 if ENABLE_NRF24)
+ * Required Libraries: Servo, Wire, EEPROM (+ RF24 if ENABLE_NRF24)
+ * (No ArduinoJson required: uses zero-heap C JSON parser & Flash F() serializer)
  *
  * SRAM-optimized for ATmega328P (2 KB SRAM):
  * - Outgoing JSON uses Serial.print(F(...)) -> 0 bytes SRAM.
- * - Incoming JSON uses a single StaticJsonDocument<256>.
+ * - Incoming JSON uses zero-allocation C field helpers -> 0 bytes heap.
  * - Wire.setWireTimeout(3000, true) prevents I2C lockups if MPU6050 is unplugged.
  */
 
 #include <Wire.h>
 #include <Servo.h>
 #include <EEPROM.h>
-#include <ArduinoJson.h>
 #include "config.h"
 
 #ifdef ENABLE_NRF24
@@ -76,8 +76,22 @@ uint16_t rxRoll = 1500, rxPitch = 1500, rxThr = 1000, rxYaw = 1500;
 unsigned long lastRxPacketMs = 0;
 
 // Serial line buffer (fixed-size to avoid SRAM fragmentation)
-char rxBuf[240];
-uint8_t rxPos = 0;
+char rxBuf[320];
+uint16_t rxPos = 0;
+bool rxLineReady = false;
+
+void bufferSerialBytes() {
+  while (Serial.available() > 0 && !rxLineReady) {
+    char c = (char)Serial.read();
+    if (c == '\n') {
+      rxBuf[rxPos] = '\0';
+      if (rxPos > 0) rxLineReady = true;
+      rxPos = 0;
+    } else if (c != '\r' && rxPos < sizeof(rxBuf) - 1) {
+      rxBuf[rxPos++] = c;
+    }
+  }
+}
 
 // ---- Helpers ----
 int freeRamBytes() {
@@ -249,17 +263,67 @@ void runCalibration(const char* target) {
   }
 }
 
+// ---- Zero-Allocation C JSON Field Helpers ----
+const char* findJsonKey(const char* src, const char* key) {
+  if (!src) return nullptr;
+  char pat[28];
+  snprintf(pat, sizeof(pat), "\"%s\":", key);
+  const char* p = strstr(src, pat);
+  if (!p) return nullptr;
+  p += strlen(pat);
+  while (*p == ' ' || *p == '\t') p++;
+  return p;
+}
+
+long jsonGetLong(const char* src, const char* key, long fallback) {
+  const char* p = findJsonKey(src, key);
+  if (!p) return fallback;
+  return strtol(p, nullptr, 10);
+}
+
+float jsonGetFloat(const char* src, const char* key, float fallback) {
+  const char* p = findJsonKey(src, key);
+  if (!p) return fallback;
+  return (float)strtod(p, nullptr);
+}
+
+bool jsonGetBool(const char* src, const char* key, bool fallback) {
+  const char* p = findJsonKey(src, key);
+  if (!p) return fallback;
+  if (strncmp(p, "true", 4) == 0) return true;
+  if (strncmp(p, "false", 5) == 0) return false;
+  return fallback;
+}
+
+bool jsonGetStr(const char* src, const char* key, char* out, size_t outLen) {
+  const char* p = findJsonKey(src, key);
+  if (!p || *p != '"') return false;
+  p++;
+  size_t i = 0;
+  while (*p && *p != '"' && i + 1 < outLen) {
+    out[i++] = *p++;
+  }
+  out[i] = '\0';
+  return true;
+}
+
+void parseAxisPID(const char* block, const char* axisKey, AxisPID& target) {
+  const char* ax = findJsonKey(block, axisKey);
+  if (!ax) return;
+  target.p = jsonGetFloat(ax, "p", target.p);
+  target.i = jsonGetFloat(ax, "i", target.i);
+  target.d = jsonGetFloat(ax, "d", target.d);
+}
+
 void handleJsonCommand(const char* line) {
-  StaticJsonDocument<256> req;
-  DeserializationError err = deserializeJson(req, line);
-  if (err) {
-    sendError(-1, "", "BAD_JSON", "Malformed JSON");
+  char cmd[24] = "";
+  if (!jsonGetStr(line, "cmd", cmd, sizeof(cmd))) {
+    sendError(-1, "", "BAD_JSON", "Missing cmd");
     return;
   }
-
-  long id = req["id"] | -1L;
-  const char* cmd = req["cmd"] | "";
-  JsonObject data = req["data"];
+  long id = jsonGetLong(line, "id", -1L);
+  const char* data = findJsonKey(line, "data");
+  if (!data) data = line;
 
   if (strcmp(cmd, "hello") == 0) {
     sendAckPrefix(id, cmd);
@@ -285,18 +349,18 @@ void handleJsonCommand(const char* line) {
   }
 
   if (strcmp(cmd, "set_pid") == 0) {
-    cfg.angleLoopEnabled = data["angle_loop_enabled"] | cfg.angleLoopEnabled;
-    if (data.containsKey("rate")) {
-      JsonObject rate = data["rate"];
-      cfg.rateRoll  = {rate["roll"]["p"] | cfg.rateRoll.p,   rate["roll"]["i"] | cfg.rateRoll.i,   rate["roll"]["d"] | cfg.rateRoll.d};
-      cfg.ratePitch = {rate["pitch"]["p"] | cfg.ratePitch.p, rate["pitch"]["i"] | cfg.ratePitch.i, rate["pitch"]["d"] | cfg.ratePitch.d};
-      cfg.rateYaw   = {rate["yaw"]["p"] | cfg.rateYaw.p,     rate["yaw"]["i"] | cfg.rateYaw.i,     rate["yaw"]["d"] | cfg.rateYaw.d};
+    cfg.angleLoopEnabled = jsonGetBool(data, "angle_loop_enabled", cfg.angleLoopEnabled);
+    const char* rate = findJsonKey(data, "rate");
+    if (rate) {
+      parseAxisPID(rate, "roll", cfg.rateRoll);
+      parseAxisPID(rate, "pitch", cfg.ratePitch);
+      parseAxisPID(rate, "yaw", cfg.rateYaw);
     }
-    if (data.containsKey("angle")) {
-      JsonObject ang = data["angle"];
-      cfg.angleRoll  = {ang["roll"]["p"] | cfg.angleRoll.p,   ang["roll"]["i"] | cfg.angleRoll.i,   ang["roll"]["d"] | cfg.angleRoll.d};
-      cfg.anglePitch = {ang["pitch"]["p"] | cfg.anglePitch.p, ang["pitch"]["i"] | cfg.anglePitch.i, ang["pitch"]["d"] | cfg.anglePitch.d};
-      cfg.angleYaw   = {ang["yaw"]["p"] | cfg.angleYaw.p,     ang["yaw"]["i"] | cfg.angleYaw.i,     ang["yaw"]["d"] | cfg.angleYaw.d};
+    const char* ang = findJsonKey(data, "angle");
+    if (ang) {
+      parseAxisPID(ang, "roll", cfg.angleRoll);
+      parseAxisPID(ang, "pitch", cfg.anglePitch);
+      parseAxisPID(ang, "yaw", cfg.angleYaw);
     }
     sendAckPrefix(id, cmd);
     Serial.print(F("{\"pid\":"));
@@ -324,7 +388,8 @@ void handleJsonCommand(const char* line) {
   if (strcmp(cmd, "cal_start") == 0) {
     if (armed) { sendError(id, cmd, "ARMED", "Disarm before calibrating"); return; }
     if (!mpuConnected) { sendError(id, cmd, "NO_MPU", "MPU6050 not detected"); return; }
-    const char* target = data["target"] | "gyro";
+    char target[12] = "gyro";
+    jsonGetStr(data, "target", target, sizeof(target));
     sendAckPrefix(id, cmd);
     Serial.println(F("{\"started\":true}}"));
     runCalibration(target);
@@ -333,9 +398,9 @@ void handleJsonCommand(const char* line) {
 
   if (strcmp(cmd, "motor_test") == 0) {
     if (armed) { sendError(id, cmd, "ARMED", "Cannot test motors while armed"); return; }
-    if (!(data["confirm"] | false)) { sendError(id, cmd, "NO_CONFIRM", "Confirmation required"); return; }
-    int m = data["motor"] | 0;
-    int pwm = data["pwm"] | 1000;
+    if (!jsonGetBool(data, "confirm", false)) { sendError(id, cmd, "NO_CONFIRM", "Confirmation required"); return; }
+    int m = (int)jsonGetLong(data, "motor", 0);
+    int pwm = (int)jsonGetLong(data, "pwm", 1000);
     if (m < 1 || m > 4) { sendError(id, cmd, "BAD_MOTOR", "Motor must be 1..4"); return; }
     if (pwm < cfg.motorMinUs || pwm > cfg.motorTestMaxUs) {
       sendError(id, cmd, "PWM_LIMIT", "PWM exceeds safe motor test cap");
@@ -360,10 +425,10 @@ void handleJsonCommand(const char* line) {
   }
 
   if (strcmp(cmd, "set_motor_cfg") == 0) {
-    cfg.motorMinUs = constrain((int)(data["min_us"] | cfg.motorMinUs), 900, 1200);
-    cfg.motorIdleUs = constrain((int)(data["idle_us"] | cfg.motorIdleUs), 1000, 1300);
-    cfg.motorMaxUs = constrain((int)(data["max_us"] | cfg.motorMaxUs), 1700, 2100);
-    cfg.motorTestMaxUs = constrain((int)(data["test_max_us"] | cfg.motorTestMaxUs), cfg.motorMinUs, 1400);
+    cfg.motorMinUs = constrain((int)jsonGetLong(data, "min_us", cfg.motorMinUs), 900, 1200);
+    cfg.motorIdleUs = constrain((int)jsonGetLong(data, "idle_us", cfg.motorIdleUs), 1000, 1300);
+    cfg.motorMaxUs = constrain((int)jsonGetLong(data, "max_us", cfg.motorMaxUs), 1700, 2100);
+    cfg.motorTestMaxUs = constrain((int)jsonGetLong(data, "test_max_us", cfg.motorTestMaxUs), cfg.motorMinUs, 1400);
     sendAckPrefix(id, cmd);
     Serial.print(F("{\"motor\":{\"min_us\":")); Serial.print(cfg.motorMinUs);
     Serial.print(F(",\"idle_us\":")); Serial.print(cfg.motorIdleUs);
@@ -374,7 +439,7 @@ void handleJsonCommand(const char* line) {
   }
 
   if (strcmp(cmd, "set_radio_cfg") == 0) {
-    cfg.radioTimeoutMs = constrain((int)(data["timeout_ms"] | cfg.radioTimeoutMs), 100, 5000);
+    cfg.radioTimeoutMs = constrain((int)jsonGetLong(data, "timeout_ms", cfg.radioTimeoutMs), 100, 5000);
     sendAckPrefix(id, cmd);
     Serial.print(F("{\"timeout_ms\":")); Serial.print(cfg.radioTimeoutMs);
     Serial.println(F("}}"));
@@ -382,8 +447,8 @@ void handleJsonCommand(const char* line) {
   }
 
   if (strcmp(cmd, "set_stream") == 0) {
-    streamEnabled = data["enabled"] | true;
-    int rate = constrain((int)(data["rate_hz"] | 20), 5, 50);
+    streamEnabled = jsonGetBool(data, "enabled", true);
+    int rate = constrain((int)jsonGetLong(data, "rate_hz", 20), 5, 50);
     streamIntervalMs = 1000 / rate;
     sendAckPrefix(id, cmd);
     Serial.print(F("{\"rate_hz\":")); Serial.print(rate);
@@ -405,6 +470,7 @@ void sendTelemetry() {
 #endif
   Serial.print(F(",\"hz\":")); Serial.print(loopHz);
   Serial.print(F(",\"ram\":")); Serial.print(freeRamBytes());
+  bufferSerialBytes();
 
   Serial.print(F("},\"imu\":{\"ax\":")); Serial.print(ax, 3);
   Serial.print(F(",\"ay\":")); Serial.print(ay, 3);
@@ -420,6 +486,7 @@ void sendTelemetry() {
   Serial.print(F(",\"gcal\":")); Serial.print(cfg.gyroCalibrated ? F("true") : F("false"));
   Serial.print(F(",\"acal\":")); Serial.print(cfg.accelCalibrated ? F("true") : F("false"));
   Serial.print(F(",\"ts\":")); Serial.print(millis());
+  bufferSerialBytes();
 
   Serial.print(F("},\"rx\":{\"roll\":")); Serial.print(rxRoll);
   Serial.print(F(",\"pitch\":")); Serial.print(rxPitch);
@@ -469,13 +536,20 @@ void setup() {
   lastLoopUs = micros();
 }
 
+unsigned long lastMpuRetryMs = 0;
+
 void loop() {
   unsigned long nowUs = micros();
   float dt = (nowUs - lastLoopUs) / 1000000.0f;
   if (dt <= 0.0f || dt > 0.1f) dt = 0.004f;
   lastLoopUs = nowUs;
 
-  mpuConnected = readMPU6050(dt);
+  if (mpuConnected) {
+    mpuConnected = readMPU6050(dt);
+  } else if (millis() - lastMpuRetryMs >= 500) {
+    lastMpuRetryMs = millis();
+    mpuConnected = initMPU6050();
+  }
 
 #ifdef ENABLE_NRF24
   if (radio.available()) {
@@ -506,15 +580,10 @@ void loop() {
     stopAllMotors();
   }
 
-  while (Serial.available() > 0) {
-    char c = (char)Serial.read();
-    if (c == '\n') {
-      rxBuf[rxPos] = '\0';
-      if (rxPos > 0) handleJsonCommand(rxBuf);
-      rxPos = 0;
-    } else if (c != '\r' && rxPos < sizeof(rxBuf) - 1) {
-      rxBuf[rxPos++] = c;
-    }
+  bufferSerialBytes();
+  if (rxLineReady) {
+    handleJsonCommand(rxBuf);
+    rxLineReady = false;
   }
 
   if (streamEnabled && (millis() - lastTelemetryMs >= streamIntervalMs)) {

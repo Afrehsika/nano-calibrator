@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
+
+os.environ.setdefault("QT_LOGGING_RULES", "qt.qpa.window=false")
 
 from PySide6.QtWidgets import QApplication
 

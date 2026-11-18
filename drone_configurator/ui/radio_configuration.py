@@ -69,10 +69,28 @@ class RadioConfigurationPage(QWidget):
 
         top_row.addWidget(live_card, 2)
 
-        joy_card = CardFrame("Joystick X / Y")
+        sticks_card = CardFrame("Dual Joystick Monitor")
+        sticks_row = QHBoxLayout()
+        sticks_row.setSpacing(12)
+
+        left_box = QVBoxLayout()
+        left_lbl = QLabel("Left Stick (Yaw / Throttle)")
+        left_lbl.setObjectName("MutedLabel")
+        self.left_joystick = JoystickVisualizerWidget()
+        left_box.addWidget(left_lbl)
+        left_box.addWidget(self.left_joystick)
+
+        right_box = QVBoxLayout()
+        right_lbl = QLabel("Right Stick (Roll / Pitch)")
+        right_lbl.setObjectName("MutedLabel")
         self.joystick = JoystickVisualizerWidget()
-        joy_card.body_layout.addWidget(self.joystick)
-        top_row.addWidget(joy_card, 1)
+        right_box.addWidget(right_lbl)
+        right_box.addWidget(self.joystick)
+
+        sticks_row.addLayout(left_box)
+        sticks_row.addLayout(right_box)
+        sticks_card.body_layout.addLayout(sticks_row)
+        top_row.addWidget(sticks_card, 2)
 
         root.addLayout(top_row)
 
@@ -179,4 +197,7 @@ class RadioConfigurationPage(QWidget):
         self.ch_bars["throttle"].setValue(rx.throttle_us)
         self.ch_bars["yaw"].setValue(rx.yaw_us)
         self.joystick.set_position(rx.joystick_x, rx.joystick_y)
+        yaw_norm = max(-1.0, min(1.0, (rx.yaw_us - 1500) / 500.0))
+        thr_norm = max(-1.0, min(1.0, (rx.throttle_us - 1500) / 500.0))
+        self.left_joystick.set_position(yaw_norm, thr_norm)
 

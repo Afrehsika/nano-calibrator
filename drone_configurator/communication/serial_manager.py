@@ -199,7 +199,7 @@ class _SerialWorker(QThread):
             for i in range(0, len(frame), chunk_size):
                 self._serial.write(frame[i : i + chunk_size])
                 if i + chunk_size < len(frame):
-                    time.sleep(0.005)
+                    time.sleep(0.008)
 
     def _check_timeouts(self) -> None:
         now = time.monotonic()

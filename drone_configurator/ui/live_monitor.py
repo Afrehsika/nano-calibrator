@@ -6,6 +6,7 @@ from collections import deque
 
 import numpy as np
 import pyqtgraph as pg
+from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
@@ -18,7 +19,7 @@ from models.sensor_data import IMUData
 from ui.theme import PALETTE
 
 
-pg.setConfigOptions(antialias=True, background=PALETTE["bg_card"], foreground=PALETTE["text_primary"])
+pg.setConfigOptions(antialias=False, background=PALETTE["bg_card"], foreground=PALETTE["text_primary"])
 
 
 class LiveMonitorPage(QWidget):
@@ -28,6 +29,7 @@ class LiveMonitorPage(QWidget):
         super().__init__(parent)
         self._max_points = max_points
         self._paused = False
+        self._dirty = False
         self._sample_idx = 0
 
         self._x_buf: deque[int] = deque(maxlen=max_points)
@@ -44,6 +46,12 @@ class LiveMonitorPage(QWidget):
         self._az: deque[float] = deque(maxlen=max_points)
 
         self._build_ui()
+
+        # Throttle chart repaints to ~15 FPS and only when visible so Qt UI never freezes
+        self._render_timer = QTimer(self)
+        self._render_timer.setInterval(66)
+        self._render_timer.timeout.connect(self._flush_plots)
+        self._render_timer.start()
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
@@ -94,9 +102,10 @@ class LiveMonitorPage(QWidget):
     @staticmethod
     def _create_plot(title: str) -> pg.PlotWidget:
         pw = pg.PlotWidget(title=title)
-        pw.showGrid(x=True, y=True, alpha=0.25)
+        pw.showGrid(x=True, y=True, alpha=0.22)
         pw.addLegend(offset=(10, 10))
         pw.setMouseEnabled(x=False, y=True)
+        pw.setClipToView(True)
         return pw
 
     def _pause(self) -> None:
@@ -108,9 +117,11 @@ class LiveMonitorPage(QWidget):
         self._paused = False
         self.pause_btn.setEnabled(True)
         self.resume_btn.setEnabled(False)
+        self._dirty = True
 
     def clear_graphs(self) -> None:
         self._sample_idx = 0
+        self._dirty = False
         for buf in (
             self._x_buf, self._roll, self._pitch, self._yaw_rate,
             self._gx, self._gy, self._gz, self._ax, self._ay, self._az,
@@ -137,15 +148,19 @@ class LiveMonitorPage(QWidget):
         self._ax.append(imu.ax)
         self._ay.append(imu.ay)
         self._az.append(imu.az)
+        self._dirty = True
 
+    def _flush_plots(self) -> None:
+        if not self._dirty or self._paused or not self.isVisible() or not self._x_buf:
+            return
+        self._dirty = False
         x = np.asarray(self._x_buf)
-        self.c_roll.setData(x, np.asarray(self._roll))
-        self.c_pitch.setData(x, np.asarray(self._pitch))
-        self.c_yaw.setData(x, np.asarray(self._yaw_rate))
-        self.c_gx.setData(x, np.asarray(self._gx))
-        self.c_gy.setData(x, np.asarray(self._gy))
-        self.c_gz.setData(x, np.asarray(self._gz))
-        self.c_ax.setData(x, np.asarray(self._ax))
-        self.c_ay.setData(x, np.asarray(self._ay))
-        self.c_az.setData(x, np.asarray(self._az))
-
+        self.c_roll.setData(x, np.asarray(self._roll), skipFiniteCheck=True)
+        self.c_pitch.setData(x, np.asarray(self._pitch), skipFiniteCheck=True)
+        self.c_yaw.setData(x, np.asarray(self._yaw_rate), skipFiniteCheck=True)
+        self.c_gx.setData(x, np.asarray(self._gx), skipFiniteCheck=True)
+        self.c_gy.setData(x, np.asarray(self._gy), skipFiniteCheck=True)
+        self.c_gz.setData(x, np.asarray(self._gz), skipFiniteCheck=True)
+        self.c_ax.setData(x, np.asarray(self._ax), skipFiniteCheck=True)
+        self.c_ay.setData(x, np.asarray(self._ay), skipFiniteCheck=True)
+        self.c_az.setData(x, np.asarray(self._az), skipFiniteCheck=True)

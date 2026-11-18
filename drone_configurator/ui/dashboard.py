@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import Signal
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QComboBox,
     QGridLayout,
     QHBoxLayout,
     QLabel,
     QPushButton,
+    QScrollArea,
+    QSplitter,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -40,6 +42,11 @@ class DashboardPage(QWidget):
         title.setObjectName("PageTitle")
         root.addWidget(title)
 
+        top_container = QWidget()
+        top_layout = QVBoxLayout(top_container)
+        top_layout.setContentsMargins(0, 0, 0, 0)
+        top_layout.setSpacing(14)
+
         # Connection Bar Card
         conn_card = CardFrame("Flight Controller Connection", "Connect via USB serial to the receiver Arduino Nano (ATmega328P).")
         conn_row = QHBoxLayout()
@@ -70,7 +77,7 @@ class DashboardPage(QWidget):
         conn_row.addWidget(self.connect_btn)
         conn_row.addWidget(self.disconnect_btn)
         conn_card.body_layout.addLayout(conn_row)
-        root.addWidget(conn_card)
+        top_layout.addWidget(conn_card)
 
         # Subsystem Status Pills
         status_card = CardFrame("Subsystem Status")
@@ -96,7 +103,7 @@ class DashboardPage(QWidget):
             pill_grid.addLayout(box, 0, col)
 
         status_card.body_layout.addLayout(pill_grid)
-        root.addWidget(status_card)
+        top_layout.addWidget(status_card)
 
         # Middle row: Telemetry Metrics + Artificial Horizon
         mid_row = QHBoxLayout()
@@ -104,12 +111,12 @@ class DashboardPage(QWidget):
 
         metrics_grid = QGridLayout()
         metrics_grid.setSpacing(12)
-        self.roll_tile = MetricTile("Roll", "deg")
-        self.pitch_tile = MetricTile("Pitch", "deg")
-        self.yaw_tile = MetricTile("Yaw Rate", "deg/s")
-        self.bat_tile = MetricTile("Battery", "")
-        self.hz_tile = MetricTile("Loop Rate", "Hz")
-        self.ram_tile = MetricTile("Free SRAM", "B")
+        self.roll_tile = MetricTile("Roll", "deg", "#38BDF8")
+        self.pitch_tile = MetricTile("Pitch", "deg", "#10B981")
+        self.yaw_tile = MetricTile("Yaw Rate", "deg/s", "#818CF8")
+        self.bat_tile = MetricTile("Battery", "", "#F59E0B")
+        self.hz_tile = MetricTile("Loop Rate", "Hz", "#38BDF8")
+        self.ram_tile = MetricTile("Free SRAM", "B", "#10B981")
 
         metrics_grid.addWidget(self.roll_tile, 0, 0)
         metrics_grid.addWidget(self.pitch_tile, 0, 1)
@@ -131,18 +138,59 @@ class DashboardPage(QWidget):
         horizon_card.body_layout.addWidget(self.device_label)
         mid_row.addWidget(horizon_card, 1)
 
-        root.addLayout(mid_row)
+        top_layout.addLayout(mid_row)
 
-        # Warnings & Event Log
-        log_card = CardFrame("System Warnings & Event Log")
+        # Warnings & Event Log (resizable via splitter + +/- buttons)
+        log_card = CardFrame("System Warnings & Event Log", "Drag the divider above or use +/- to resize the log area.")
+        log_hdr = QHBoxLayout()
         self.warnings_label = QLabel("No active warnings.")
-        self.warnings_label.setStyleSheet(f"color: {PALETTE['success']}; font-weight: 500;")
+        self.warnings_label.setStyleSheet(f"color: {PALETTE['success']}; font-weight: 500; background: transparent;")
+
+        self.log_dec_btn = QPushButton("−")
+        self.log_dec_btn.setFixedSize(32, 28)
+        self.log_dec_btn.setStyleSheet("padding: 0px; font-size: 16px; font-weight: 700;")
+        self.log_dec_btn.setToolTip("Decrease system log height")
+        self.log_dec_btn.clicked.connect(lambda: self._adjust_log_height(-80))
+
+        self.log_inc_btn = QPushButton("+")
+        self.log_inc_btn.setFixedSize(32, 28)
+        self.log_inc_btn.setStyleSheet("padding: 0px; font-size: 16px; font-weight: 700;")
+        self.log_inc_btn.setToolTip("Increase system log height")
+        self.log_inc_btn.clicked.connect(lambda: self._adjust_log_height(80))
+
+        self.log_clear_btn = QPushButton("Clear")
+        self.log_clear_btn.clicked.connect(lambda: self.log_box.clear())
+
+        log_hdr.addWidget(self.warnings_label, 1)
+        log_hdr.addWidget(self.log_dec_btn)
+        log_hdr.addWidget(self.log_inc_btn)
+        log_hdr.addWidget(self.log_clear_btn)
+
         self.log_box = QTextEdit()
         self.log_box.setReadOnly(True)
-        self.log_box.setMaximumHeight(140)
-        log_card.body_layout.addWidget(self.warnings_label)
-        log_card.body_layout.addWidget(self.log_box)
-        root.addWidget(log_card)
+        self.log_box.setMinimumHeight(90)
+        log_card.body_layout.addLayout(log_hdr)
+        log_card.body_layout.addWidget(self.log_box, 1)
+
+        top_scroll = QScrollArea()
+        top_scroll.setWidgetResizable(True)
+        top_scroll.setWidget(top_container)
+
+        self.splitter = QSplitter(Qt.Orientation.Vertical)
+        self.splitter.setHandleWidth(6)
+        self.splitter.addWidget(top_scroll)
+        self.splitter.addWidget(log_card)
+        self.splitter.setStretchFactor(0, 2)
+        self.splitter.setStretchFactor(1, 1)
+        self.splitter.setSizes([470, 220])
+        root.addWidget(self.splitter, 1)
+
+    def _adjust_log_height(self, delta: int) -> None:
+        sizes = self.splitter.sizes()
+        if len(sizes) == 2:
+            total = sizes[0] + sizes[1]
+            new_log = max(120, min(total - 180, sizes[1] + delta))
+            self.splitter.setSizes([total - new_log, new_log])
 
     def refresh_ports(self) -> None:
         current = self.port_combo.currentData()

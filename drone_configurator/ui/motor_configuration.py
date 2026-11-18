@@ -22,7 +22,7 @@ from PySide6.QtCore import Qt
 from models.motor_config import MotorConfig, MotorOutputs
 from models.sensor_data import SystemStatus
 from ui.theme import PALETTE
-from ui.widgets import CardFrame, StatusPill
+from ui.widgets import CardFrame, QuadXDiagramWidget, StatusPill
 
 
 class _MotorCard(CardFrame):
@@ -126,7 +126,10 @@ class MotorConfigurationPage(QWidget):
         b_layout.addLayout(safety_row)
         root.addWidget(banner)
 
-        # 4 Individual Motor Cards (Quad-X)
+        # 4 Individual Motor Cards + Live Quad-X Frame Diagram
+        center_row = QHBoxLayout()
+        center_row.setSpacing(14)
+
         grid = QGridLayout()
         grid.setSpacing(12)
         specs = [
@@ -145,7 +148,14 @@ class MotorConfigurationPage(QWidget):
 
         grid_wrap = QWidget()
         grid_wrap.setLayout(grid)
-        root.addWidget(grid_wrap)
+        center_row.addWidget(grid_wrap, 2)
+
+        diagram_card = CardFrame("Quad-X Frame Layout", "Live ESC output rings (green/amber/red)")
+        self.quad_diagram = QuadXDiagramWidget()
+        diagram_card.body_layout.addWidget(self.quad_diagram, 1)
+        center_row.addWidget(diagram_card, 1)
+
+        root.addLayout(center_row)
 
         # Output Range & ESC Calibration Status
         cfg_card = CardFrame("ESC & Output Range Configuration")
@@ -251,6 +261,7 @@ class MotorConfigurationPage(QWidget):
         if status.armed != self._armed:
             self._armed = status.armed
             self._update_test_interlock()
+        self.quad_diagram.set_outputs(motors.m1_us, motors.m2_us, motors.m3_us, motors.m4_us)
         for card, pwm in zip(self.motor_cards, (motors.m1_us, motors.m2_us, motors.m3_us, motors.m4_us)):
             card.update_output(pwm)
 

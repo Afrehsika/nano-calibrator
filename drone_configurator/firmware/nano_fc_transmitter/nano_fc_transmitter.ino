@@ -1,13 +1,13 @@
 /*
- * NanoFC Quad-X Joystick Transmitter Firmware (No OLED)
+ * NanoFC Quad-X Dual-Joystick Transmitter Firmware (No OLED)
  * Target: Classic Arduino Nano (ATmega328P, 5V, 16 MHz)
  * Required Library: RF24 (by TMRh20)
  *
  * Wiring:
  *   nRF24L01: CE -> D7, CSN -> D8, SCK -> D13, MOSI -> D11, MISO -> D12, VCC -> 3.3V
- *   Joystick: X -> A2, Y -> A1
- *   Button:   D2 -> GND (INPUT_PULLUP)
- *   LED:      D4 (TX link status)
+ *   Left Joystick  (Mode 2): Y (Throttle) -> A1, X (Yaw)   -> A2, Button -> D2
+ *   Right Joystick (Mode 2): Y (Pitch)    -> A0, X (Roll)  -> A3, Button -> D3
+ *   LED: D4 (TX link status)
  */
 
 #include <SPI.h>
@@ -17,26 +17,45 @@
 RF24 radio(7, 8);
 const byte address[6] = "00001";
 
-#define BUTTON_PIN   2
-#define JOYSTICK_X   A2
-#define JOYSTICK_Y   A1
+// Left Stick (Throttle + Yaw)
+#define JOY1_X       A2   // Yaw
+#define JOY1_Y       A1   // Throttle
+#define BTN1_PIN     2
+
+// Right Stick (Roll + Pitch)
+#define JOY2_X       A3   // Roll
+#define JOY2_Y       A0   // Pitch
+#define BTN2_PIN     3
+
 #define PIN_TX_LED   4
 
-#define MIN_THROTTLE 1000
-#define MAX_THROTTLE 2000
+// Set true for any axis that moves in the opposite direction
+#define INVERT_THR   false
+#define INVERT_YAW   false
+#define INVERT_ROLL  false
+#define INVERT_PITCH false
 
 struct JoystickData {
-  uint16_t x;
-  uint16_t y;
-  uint8_t button;
+  uint16_t throttle;
+  uint16_t yaw;
+  uint16_t roll;
+  uint16_t pitch;
+  uint8_t  btn1;
+  uint8_t  btn2;
 };
 
 JoystickData data;
 unsigned long lastTxMs = 0;
 
+uint16_t readAxis(uint8_t pin, bool invert) {
+  int val = analogRead(pin);
+  return invert ? (uint16_t)(1023 - val) : (uint16_t)val;
+}
+
 void setup() {
   Serial.begin(115200);
-  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  pinMode(BTN1_PIN, INPUT_PULLUP);
+  pinMode(BTN2_PIN, INPUT_PULLUP);
   pinMode(PIN_TX_LED, OUTPUT);
 
   if (!radio.begin()) {
@@ -53,25 +72,27 @@ void setup() {
   radio.setRetries(5, 15);
   radio.stopListening();
 
-  Serial.println(F("TRANSMITTER READY"));
+  Serial.println(F("DUAL-JOYSTICK TRANSMITTER READY"));
 }
 
 void loop() {
   if (millis() - lastTxMs >= 20) { // 50 Hz
     lastTxMs = millis();
 
-    data.x = analogRead(JOYSTICK_X);
-    data.y = analogRead(JOYSTICK_Y);
-    data.button = (digitalRead(BUTTON_PIN) == LOW) ? 1 : 0;
+    data.throttle = readAxis(JOY1_Y, INVERT_THR);
+    data.yaw      = readAxis(JOY1_X, INVERT_YAW);
+    data.roll     = readAxis(JOY2_X, INVERT_ROLL);
+    data.pitch    = readAxis(JOY2_Y, INVERT_PITCH);
+    data.btn1     = (digitalRead(BTN1_PIN) == LOW) ? 1 : 0;
+    data.btn2     = (digitalRead(BTN2_PIN) == LOW) ? 1 : 0;
 
     bool success = radio.write(&data, sizeof(data));
     digitalWrite(PIN_TX_LED, success ? HIGH : LOW);
 
-    int throttle = map(data.y, 0, 1023, MIN_THROTTLE, MAX_THROTTLE);
-    Serial.print(F("X: ")); Serial.print(data.x);
-    Serial.print(F(" | Y: ")); Serial.print(data.y);
-    Serial.print(F(" | THR: ")); Serial.print(throttle);
-    Serial.print(F(" | BTN: ")); Serial.print(data.button);
+    Serial.print(F("THR:")); Serial.print(map(data.throttle, 0, 1023, 1000, 2000));
+    Serial.print(F(" YAW:")); Serial.print(map(data.yaw, 0, 1023, 1000, 2000));
+    Serial.print(F(" ROL:")); Serial.print(map(data.roll, 0, 1023, 1000, 2000));
+    Serial.print(F(" PIT:")); Serial.print(map(data.pitch, 0, 1023, 1000, 2000));
     Serial.println(success ? F(" | TX OK") : F(" | TX FAILED"));
   }
 }

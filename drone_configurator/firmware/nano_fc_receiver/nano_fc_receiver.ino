@@ -21,9 +21,12 @@
 RF24 radio(PIN_NRF_CE, PIN_NRF_CSN);
 const byte RX_ADDR[6] = "00001"; // Matches your TX Nano address
 struct JoystickData {
-  uint16_t x;
-  uint16_t y;
-  uint8_t button;
+  uint16_t throttle;
+  uint16_t yaw;
+  uint16_t roll;
+  uint16_t pitch;
+  uint8_t  btn1;
+  uint8_t  btn2;
 };
 #endif
 
@@ -555,10 +558,10 @@ void loop() {
   if (radio.available()) {
     JoystickData pkt;
     radio.read(&pkt, sizeof(pkt));
-    rxRoll  = constrain(map((long)pkt.x, 0, 1023, 1000, 2000), 1000, 2000);
-    rxThr   = constrain(map((long)pkt.y, 0, 1023, 1000, 2000), 1000, 2000);
-    rxPitch = 1500;
-    rxYaw   = 1500;
+    rxThr   = constrain(map((long)pkt.throttle, 0, 1023, 1000, 2000), 1000, 2000);
+    rxYaw   = constrain(map((long)pkt.yaw,      0, 1023, 1000, 2000), 1000, 2000);
+    rxRoll  = constrain(map((long)pkt.roll,     0, 1023, 1000, 2000), 1000, 2000);
+    rxPitch = constrain(map((long)pkt.pitch,    0, 1023, 1000, 2000), 1000, 2000);
     lastRxPacketMs = millis();
     rxConnected = true;
   } else if (millis() - lastRxPacketMs > cfg.radioTimeoutMs) {
@@ -586,7 +589,7 @@ void loop() {
     rxLineReady = false;
   }
 
-  if (streamEnabled && (millis() - lastTelemetryMs >= streamIntervalMs)) {
+  if (streamEnabled && rxPos == 0 && !rxLineReady && (millis() - lastTelemetryMs >= streamIntervalMs)) {
     lastTelemetryMs = millis();
     sendTelemetry();
     digitalWrite(PIN_STATUS_LED, !digitalRead(PIN_STATUS_LED));

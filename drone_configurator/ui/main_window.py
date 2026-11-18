@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
+    QApplication,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -34,6 +36,7 @@ from ui.profiles import ProfilesPage
 from ui.radio_configuration import RadioConfigurationPage
 from ui.sensor_calibration import SensorCalibrationPage
 from ui.settings import SettingsPage
+from ui.theme import build_stylesheet
 from ui.widgets import StatusPill
 
 
@@ -49,10 +52,12 @@ class MainWindow(QMainWindow):
         self.serial_mgr = SerialManager(self)
         self.config_service = ConfigurationService(profiles_dir)
         self.calibration_service = CalibrationService()
+        self._settings_path = profiles_dir.parent / "ui_settings.json"
 
         self._nav_buttons: list[QPushButton] = []
         self._build_ui()
         self._connect_signals()
+        self._load_saved_theme()
 
     def _build_ui(self) -> None:
         central = QWidget()
@@ -64,14 +69,17 @@ class MainWindow(QMainWindow):
         # Left Sidebar
         sidebar = QFrame()
         sidebar.setObjectName("Sidebar")
-        sidebar.setFixedWidth(220)
+        sidebar.setFixedWidth(235)
         sb_layout = QVBoxLayout(sidebar)
-        sb_layout.setContentsMargins(12, 16, 12, 16)
-        sb_layout.setSpacing(6)
+        sb_layout.setContentsMargins(14, 18, 14, 16)
+        sb_layout.setSpacing(4)
 
-        brand = QLabel("NANO FC\nCONFIGURATOR")
-        brand.setStyleSheet("font-size: 16px; font-weight: 700; color: #38BDF8; padding: 4px 8px 14px 8px;")
-        sb_layout.addWidget(brand)
+        brand_title = QLabel("NANO FC")
+        brand_title.setStyleSheet("font-size: 18px; font-weight: 800; color: #38BDF8; letter-spacing: 1px; padding: 0 8px;")
+        brand_sub = QLabel("GROUND CONTROL v1.0")
+        brand_sub.setStyleSheet("font-size: 10px; font-weight: 700; color: #64748B; letter-spacing: 1.4px; padding: 0 8px 14px 8px;")
+        sb_layout.addWidget(brand_title)
+        sb_layout.addWidget(brand_sub)
 
         self.stack = QStackedWidget()
         self.dashboard_page = DashboardPage()
@@ -83,30 +91,43 @@ class MainWindow(QMainWindow):
         self.profiles_page = ProfilesPage(self.config_service)
         self.settings_page = SettingsPage()
 
-        pages = [
-            ("Dashboard", self.dashboard_page),
-            ("PID Tuning", self.pid_page),
-            ("Sensors", self.sensors_page),
-            ("Motor Configuration", self.motors_page),
-            ("Radio Configuration", self.radio_page),
-            ("Live Monitor", self.monitor_page),
-            ("Profiles", self.profiles_page),
-            ("Settings", self.settings_page),
+        nav_groups = [
+            ("FLIGHT DECK", [
+                ("◈  Dashboard", self.dashboard_page),
+                ("∿  Live Monitor", self.monitor_page),
+            ]),
+            ("TUNING & HARDWARE", [
+                ("⊞  PID Tuning", self.pid_page),
+                ("◎  Sensors & Cal", self.sensors_page),
+                ("✦  Motor Config", self.motors_page),
+                ("▤  Radio Config", self.radio_page),
+            ]),
+            ("SYSTEM", [
+                ("◫  Profiles", self.profiles_page),
+                ("⚙  Settings", self.settings_page),
+            ]),
         ]
 
-        for idx, (label, widget) in enumerate(pages):
-            self.stack.addWidget(widget)
-            btn = QPushButton(label)
-            btn.setObjectName("NavButton")
-            btn.setProperty("active", idx == 0)
-            btn.clicked.connect(lambda _checked=False, i=idx: self._switch_page(i))
-            sb_layout.addWidget(btn)
-            self._nav_buttons.append(btn)
+        page_idx = 0
+        for section, items in nav_groups:
+            sec_lbl = QLabel(section)
+            sec_lbl.setObjectName("SectionLabel")
+            sb_layout.addWidget(sec_lbl)
+            for label, widget in items:
+                self.stack.addWidget(widget)
+                btn = QPushButton(label)
+                btn.setObjectName("NavButton")
+                btn.setProperty("active", page_idx == 0)
+                idx_copy = page_idx
+                btn.clicked.connect(lambda _checked=False, i=idx_copy: self._switch_page(i))
+                sb_layout.addWidget(btn)
+                self._nav_buttons.append(btn)
+                page_idx += 1
 
         sb_layout.addStretch()
-        ver_lbl = QLabel("ATmega328P | Quad-X\nProtocol v1.0")
+        ver_lbl = QLabel("ATmega328P  |  Quad-X\nJSON Protocol v1.0")
         ver_lbl.setObjectName("MutedLabel")
-        ver_lbl.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        ver_lbl.setStyleSheet("padding: 8px; color: #64748B; font-size: 11px;")
         sb_layout.addWidget(ver_lbl)
         outer.addWidget(sidebar)
 
@@ -117,19 +138,28 @@ class MainWindow(QMainWindow):
 
         topbar = QFrame()
         topbar.setObjectName("TopBar")
-        topbar.setFixedHeight(48)
+        topbar.setFixedHeight(54)
         tb_layout = QHBoxLayout(topbar)
-        tb_layout.setContentsMargins(16, 6, 16, 6)
-        tb_layout.setSpacing(12)
+        tb_layout.setContentsMargins(20, 8, 20, 8)
+        tb_layout.setSpacing(10)
 
         self.top_conn_pill = StatusPill("DISCONNECTED", "muted")
         self.top_mode_pill = StatusPill("DISARMED", "muted")
+        self.top_bat_pill = StatusPill("BAT: N/A", "muted")
         self.top_status_lbl = QLabel("Ready. Select a serial port on Dashboard to connect.")
         self.top_status_lbl.setObjectName("MutedLabel")
 
+        self.top_stop_btn = QPushButton("STOP MOTORS")
+        self.top_stop_btn.setObjectName("DangerButton")
+        self.top_stop_btn.setEnabled(False)
+        self.top_stop_btn.setToolTip("Immediately set all 4 ESC outputs to minimum PWM")
+        self.top_stop_btn.clicked.connect(lambda: self.serial_mgr.send_command(CommandType.MOTOR_STOP))
+
         tb_layout.addWidget(self.top_conn_pill)
         tb_layout.addWidget(self.top_mode_pill)
+        tb_layout.addWidget(self.top_bat_pill)
         tb_layout.addWidget(self.top_status_lbl, 1)
+        tb_layout.addWidget(self.top_stop_btn)
 
         right_col.addWidget(topbar)
         right_col.addWidget(self.stack, 1)
@@ -159,7 +189,7 @@ class MainWindow(QMainWindow):
         self.serial_mgr.calibration_progress.connect(self.sensors_page.update_progress)
         self.serial_mgr.log_message.connect(self.dashboard_page.append_log)
 
-        # PID Tuning
+        # PID Tuning (Profiles is at index 6)
         self.pid_page.read_requested.connect(lambda: self.serial_mgr.send_command(CommandType.GET_CONFIG))
         self.pid_page.send_requested.connect(self._on_send_pid)
         self.pid_page.save_eeprom_requested.connect(lambda: self.serial_mgr.send_command(CommandType.SAVE_EEPROM))
@@ -188,8 +218,31 @@ class MainWindow(QMainWindow):
         self.settings_page.stream_rate_changed.connect(
             lambda rate: self.serial_mgr.send_command(CommandType.SET_STREAM, {"enabled": True, "rate_hz": rate})
         )
+        self.settings_page.theme_changed.connect(self._apply_and_save_theme)
+
+    def _apply_and_save_theme(self, bg_hex: str, accent_hex: str) -> None:
+        app = QApplication.instance()
+        if app is not None:
+            app.setStyleSheet(build_stylesheet(bg_hex, accent_hex))
+        self.settings_page.set_theme_display(bg_hex, accent_hex)
+        try:
+            self._settings_path.write_text(
+                json.dumps({"bg": bg_hex, "accent": accent_hex}, indent=2),
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
+
+    def _load_saved_theme(self) -> None:
+        if self._settings_path.exists():
+            try:
+                data = json.loads(self._settings_path.read_text(encoding="utf-8"))
+                self._apply_and_save_theme(data.get("bg", "#090D16"), data.get("accent", "#38BDF8"))
+            except Exception:
+                pass
 
     def _set_all_connected(self, connected: bool, info: dict[str, Any] | None = None) -> None:
+        self.top_stop_btn.setEnabled(connected)
         self.dashboard_page.set_connected_state(connected, info)
         self.pid_page.set_connected_state(connected)
         self.sensors_page.set_connected_state(connected)
@@ -209,6 +262,7 @@ class MainWindow(QMainWindow):
         self._set_all_connected(False)
         self.top_conn_pill.set_state("DISCONNECTED", "muted")
         self.top_mode_pill.set_state("OFFLINE", "muted")
+        self.top_bat_pill.set_state("BAT: N/A", "muted")
         self.top_status_lbl.setText("Disconnected from flight controller.")
         self.statusBar().showMessage("Disconnected", 3000)
 
@@ -250,6 +304,12 @@ class MainWindow(QMainWindow):
             f"{status.flight_mode} ({'ARMED' if status.armed else 'DISARMED'})",
             "danger" if status.armed else "accent",
         )
+        if status.battery_v is not None:
+            pct, _ = self.dashboard_page._estimate_lipo_pct(status.battery_v)
+            tone = "success" if pct > 30 else ("warning" if pct > 15 else "danger")
+            self.top_bat_pill.set_state(f"BAT: {status.battery_v:.2f}V ({pct}%)", tone)
+        else:
+            self.top_bat_pill.set_state("BAT: N/A", "muted")
         self.dashboard_page.update_telemetry(status, imu)
         self.sensors_page.update_imu(imu)
         self.monitor_page.update_imu(imu)

@@ -1,0 +1,525 @@
+/*
+ * NanoFC Quad-X Receiver & Flight Controller Firmware
+ * Target: Classic Arduino Nano (ATmega328P, 5V, 16 MHz)
+ * Required Libraries: ArduinoJson (v6/v7), Servo, Wire, EEPROM (+ RF24 if ENABLE_NRF24)
+ *
+ * SRAM-optimized for ATmega328P (2 KB SRAM):
+ * - Outgoing JSON uses Serial.print(F(...)) -> 0 bytes SRAM.
+ * - Incoming JSON uses a single StaticJsonDocument<256>.
+ * - Wire.setWireTimeout(3000, true) prevents I2C lockups if MPU6050 is unplugged.
+ */
+
+#include <Wire.h>
+#include <Servo.h>
+#include <EEPROM.h>
+#include <ArduinoJson.h>
+#include "config.h"
+
+#ifdef ENABLE_NRF24
+#include <SPI.h>
+#include <RF24.h>
+RF24 radio(PIN_NRF_CE, PIN_NRF_CSN);
+const byte RX_ADDR[6] = "00001"; // Matches your TX Nano address
+struct JoystickData {
+  uint16_t x;
+  uint16_t y;
+  uint8_t button;
+};
+#endif
+
+// ---- Data Structures persisted in EEPROM ----
+struct AxisPID { float p, i, d; };
+
+struct FCConfig {
+  uint16_t magic;
+  bool angleLoopEnabled;
+  AxisPID rateRoll, ratePitch, rateYaw;
+  AxisPID angleRoll, anglePitch, angleYaw;
+  uint16_t motorMinUs, motorIdleUs, motorMaxUs, motorTestMaxUs;
+  uint16_t radioTimeoutMs;
+  float gyroOffset[3];
+  float accelOffset[3];
+  bool gyroCalibrated;
+  bool accelCalibrated;
+};
+
+FCConfig cfg;
+
+// ---- Runtime State ----
+Servo esc[4];
+uint16_t motorOutUs[4] = {1000, 1000, 1000, 1000};
+bool armed = false;
+bool mpuConnected = false;
+bool rxConnected = false;
+
+// Motor test safety state
+bool motorTestActive = false;
+uint8_t motorTestIdx = 0;
+uint16_t motorTestPwm = 1000;
+unsigned long motorTestDeadlineMs = 0;
+
+// Telemetry streaming state (starts false so boot does not flood PC serial buffer before 'hello')
+bool streamEnabled = false;
+uint16_t streamIntervalMs = 50; // 20 Hz default
+unsigned long lastTelemetryMs = 0;
+unsigned long lastLoopUs = 0;
+uint16_t loopHz = 250;
+
+// IMU & Attitude state
+float ax = 0, ay = 0, az = 1.0f;
+float gx = 0, gy = 0, gz = 0;
+float imuTempC = 25.0f;
+float rollDeg = 0.0f, pitchDeg = 0.0f;
+
+// Radio state
+uint16_t rxRoll = 1500, rxPitch = 1500, rxThr = 1000, rxYaw = 1500;
+unsigned long lastRxPacketMs = 0;
+
+// Serial line buffer (fixed-size to avoid SRAM fragmentation)
+char rxBuf[240];
+uint8_t rxPos = 0;
+
+// ---- Helpers ----
+int freeRamBytes() {
+  extern int __heap_start, *__brkval;
+  int v;
+  return (int)&v - (__brkval == 0 ? (int)&__heap_start : (int)__brkval);
+}
+
+void loadDefaultConfig() {
+  cfg.magic = EEPROM_MAGIC;
+  cfg.angleLoopEnabled = true;
+  cfg.rateRoll  = {1.30f, 0.04f, 18.0f};
+  cfg.ratePitch = {1.30f, 0.04f, 18.0f};
+  cfg.rateYaw   = {3.00f, 0.02f, 0.0f};
+  cfg.angleRoll  = {4.50f, 0.00f, 0.0f};
+  cfg.anglePitch = {4.50f, 0.00f, 0.0f};
+  cfg.angleYaw   = {0.00f, 0.00f, 0.0f};
+  cfg.motorMinUs = 1000;
+  cfg.motorIdleUs = 1080;
+  cfg.motorMaxUs = 2000;
+  cfg.motorTestMaxUs = MOTOR_TEST_CAP_US;
+  cfg.radioTimeoutMs = 500;
+  for (int i = 0; i < 3; i++) {
+    cfg.gyroOffset[i] = 0.0f;
+    cfg.accelOffset[i] = 0.0f;
+  }
+  cfg.gyroCalibrated = false;
+  cfg.accelCalibrated = false;
+}
+
+void saveConfigEEPROM() {
+  EEPROM.put(0, cfg);
+}
+
+void loadConfigEEPROM() {
+  FCConfig tmp;
+  EEPROM.get(0, tmp);
+  if (tmp.magic == EEPROM_MAGIC) {
+    cfg = tmp;
+  } else {
+    loadDefaultConfig();
+    saveConfigEEPROM();
+  }
+}
+
+void stopAllMotors() {
+  motorTestActive = false;
+  for (int i = 0; i < 4; i++) {
+    motorOutUs[i] = cfg.motorMinUs;
+    esc[i].writeMicroseconds(cfg.motorMinUs);
+  }
+}
+
+bool initMPU6050() {
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(0x6B);
+  Wire.write(0x00);
+  if (Wire.endTransmission() != 0) return false;
+
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(0x1B); Wire.write(0x08);
+  Wire.endTransmission();
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(0x1C); Wire.write(0x08);
+  Wire.endTransmission();
+  return true;
+}
+
+bool readMPU6050(float dt) {
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(0x3B);
+  if (Wire.endTransmission(false) != 0) return false;
+  if (Wire.requestFrom((uint8_t)MPU6050_ADDR, (uint8_t)14, (uint8_t)true) != 14) return false;
+
+  int16_t rawAx = (Wire.read() << 8) | Wire.read();
+  int16_t rawAy = (Wire.read() << 8) | Wire.read();
+  int16_t rawAz = (Wire.read() << 8) | Wire.read();
+  int16_t rawT  = (Wire.read() << 8) | Wire.read();
+  int16_t rawGx = (Wire.read() << 8) | Wire.read();
+  int16_t rawGy = (Wire.read() << 8) | Wire.read();
+  int16_t rawGz = (Wire.read() << 8) | Wire.read();
+
+  ax = (rawAx / 8192.0f) - cfg.accelOffset[0];
+  ay = (rawAy / 8192.0f) - cfg.accelOffset[1];
+  az = (rawAz / 8192.0f) - cfg.accelOffset[2];
+  imuTempC = (rawT / 340.0f) + 36.53f;
+  gx = (rawGx / 65.5f) - cfg.gyroOffset[0];
+  gy = (rawGy / 65.5f) - cfg.gyroOffset[1];
+  gz = (rawGz / 65.5f) - cfg.gyroOffset[2];
+
+  float accRoll  = atan2(ay, az) * 57.2958f;
+  float accPitch = atan2(-ax, sqrt(ay * ay + az * az)) * 57.2958f;
+  rollDeg  = 0.98f * (rollDeg + gx * dt) + 0.02f * accRoll;
+  pitchDeg = 0.98f * (pitchDeg + gy * dt) + 0.02f * accPitch;
+  return true;
+}
+
+// ---- Zero-SRAM-Allocation JSON Serializers ----
+void printAxisPID(const AxisPID& a) {
+  Serial.print(F("{\"p\":")); Serial.print(a.p, 3);
+  Serial.print(F(",\"i\":")); Serial.print(a.i, 3);
+  Serial.print(F(",\"d\":")); Serial.print(a.d, 3);
+  Serial.print('}');
+}
+
+void printPIDObject() {
+  Serial.print(F("{\"angle_loop_enabled\":"));
+  Serial.print(cfg.angleLoopEnabled ? F("true") : F("false"));
+  Serial.print(F(",\"rate\":{\"roll\":")); printAxisPID(cfg.rateRoll);
+  Serial.print(F(",\"pitch\":")); printAxisPID(cfg.ratePitch);
+  Serial.print(F(",\"yaw\":")); printAxisPID(cfg.rateYaw);
+  Serial.print(F("},\"angle\":{\"roll\":")); printAxisPID(cfg.angleRoll);
+  Serial.print(F(",\"pitch\":")); printAxisPID(cfg.anglePitch);
+  Serial.print(F(",\"yaw\":")); printAxisPID(cfg.angleYaw);
+  Serial.print(F("}}"));
+}
+
+void sendError(long id, const char* cmd, const char* code, const char* msg) {
+  Serial.print(F("{\"type\":\"err\""));
+  if (id >= 0) { Serial.print(F(",\"id\":")); Serial.print(id); }
+  Serial.print(F(",\"cmd\":\"")); Serial.print(cmd);
+  Serial.print(F("\",\"ok\":false,\"code\":\"")); Serial.print(code);
+  Serial.print(F("\",\"msg\":\"")); Serial.print(msg);
+  Serial.println(F("\"}"));
+}
+
+void sendAckPrefix(long id, const char* cmd) {
+  Serial.print(F("{\"type\":\"ack\",\"id\":"));
+  Serial.print(id);
+  Serial.print(F(",\"cmd\":\""));
+  Serial.print(cmd);
+  Serial.print(F("\",\"ok\":true,\"data\":"));
+}
+
+void runCalibration(const char* target) {
+  const int SAMPLES = 150;
+  float sum[3] = {0, 0, 0};
+  for (int i = 0; i < SAMPLES; i++) {
+    readMPU6050(0.005f);
+    if (strcmp(target, "gyro") == 0) {
+      sum[0] += gx + cfg.gyroOffset[0];
+      sum[1] += gy + cfg.gyroOffset[1];
+      sum[2] += gz + cfg.gyroOffset[2];
+    } else {
+      sum[0] += ax + cfg.accelOffset[0];
+      sum[1] += ay + cfg.accelOffset[1];
+      sum[2] += (az + cfg.accelOffset[2]) - 1.0f;
+    }
+    if (i % 30 == 0 || i == SAMPLES - 1) {
+      int pct = ((i + 1) * 100) / SAMPLES;
+      Serial.print(F("{\"type\":\"cal_progress\",\"target\":\""));
+      Serial.print(target);
+      Serial.print(F("\",\"pct\":"));
+      Serial.print(pct);
+      Serial.print(F(",\"stage\":\""));
+      Serial.print(pct >= 100 ? F("done") : F("sampling"));
+      Serial.print(F("\",\"msg\":\""));
+      Serial.print(pct >= 100 ? F("Calibration complete") : F("Sampling offsets..."));
+      Serial.println(F("\"}"));
+    }
+    delay(5);
+  }
+  if (strcmp(target, "gyro") == 0) {
+    for (int k = 0; k < 3; k++) cfg.gyroOffset[k] = sum[k] / SAMPLES;
+    cfg.gyroCalibrated = true;
+  } else {
+    for (int k = 0; k < 3; k++) cfg.accelOffset[k] = sum[k] / SAMPLES;
+    cfg.accelCalibrated = true;
+  }
+}
+
+void handleJsonCommand(const char* line) {
+  StaticJsonDocument<256> req;
+  DeserializationError err = deserializeJson(req, line);
+  if (err) {
+    sendError(-1, "", "BAD_JSON", "Malformed JSON");
+    return;
+  }
+
+  long id = req["id"] | -1L;
+  const char* cmd = req["cmd"] | "";
+  JsonObject data = req["data"];
+
+  if (strcmp(cmd, "hello") == 0) {
+    sendAckPrefix(id, cmd);
+    Serial.print(F("{\"device\":\"" FC_DEVICE_NAME "\",\"mcu\":\"" FC_MCU_NAME
+                   "\",\"fw_version\":\"" FC_FW_VERSION "\",\"protocol_version\":\"" FC_PROTOCOL_VER
+                   "\",\"layout\":\"" FC_LAYOUT_NAME "\"}"));
+    Serial.println('}');
+    return;
+  }
+
+  if (strcmp(cmd, "get_config") == 0) {
+    sendAckPrefix(id, cmd);
+    Serial.print(F("{\"pid\":"));
+    printPIDObject();
+    Serial.print(F(",\"motor\":{\"min_us\":")); Serial.print(cfg.motorMinUs);
+    Serial.print(F(",\"idle_us\":")); Serial.print(cfg.motorIdleUs);
+    Serial.print(F(",\"max_us\":")); Serial.print(cfg.motorMaxUs);
+    Serial.print(F(",\"test_max_us\":")); Serial.print(cfg.motorTestMaxUs);
+    Serial.print(F(",\"esc_cal\":true},\"radio\":{\"timeout_ms\":"));
+    Serial.print(cfg.radioTimeoutMs);
+    Serial.println(F("}}}"));
+    return;
+  }
+
+  if (strcmp(cmd, "set_pid") == 0) {
+    cfg.angleLoopEnabled = data["angle_loop_enabled"] | cfg.angleLoopEnabled;
+    if (data.containsKey("rate")) {
+      JsonObject rate = data["rate"];
+      cfg.rateRoll  = {rate["roll"]["p"] | cfg.rateRoll.p,   rate["roll"]["i"] | cfg.rateRoll.i,   rate["roll"]["d"] | cfg.rateRoll.d};
+      cfg.ratePitch = {rate["pitch"]["p"] | cfg.ratePitch.p, rate["pitch"]["i"] | cfg.ratePitch.i, rate["pitch"]["d"] | cfg.ratePitch.d};
+      cfg.rateYaw   = {rate["yaw"]["p"] | cfg.rateYaw.p,     rate["yaw"]["i"] | cfg.rateYaw.i,     rate["yaw"]["d"] | cfg.rateYaw.d};
+    }
+    if (data.containsKey("angle")) {
+      JsonObject ang = data["angle"];
+      cfg.angleRoll  = {ang["roll"]["p"] | cfg.angleRoll.p,   ang["roll"]["i"] | cfg.angleRoll.i,   ang["roll"]["d"] | cfg.angleRoll.d};
+      cfg.anglePitch = {ang["pitch"]["p"] | cfg.anglePitch.p, ang["pitch"]["i"] | cfg.anglePitch.i, ang["pitch"]["d"] | cfg.anglePitch.d};
+      cfg.angleYaw   = {ang["yaw"]["p"] | cfg.angleYaw.p,     ang["yaw"]["i"] | cfg.angleYaw.i,     ang["yaw"]["d"] | cfg.angleYaw.d};
+    }
+    sendAckPrefix(id, cmd);
+    Serial.print(F("{\"pid\":"));
+    printPIDObject();
+    Serial.println(F("}}"));
+    return;
+  }
+
+  if (strcmp(cmd, "reset_pid") == 0) {
+    loadDefaultConfig();
+    sendAckPrefix(id, cmd);
+    Serial.print(F("{\"pid\":"));
+    printPIDObject();
+    Serial.println(F("}}"));
+    return;
+  }
+
+  if (strcmp(cmd, "save_eeprom") == 0) {
+    saveConfigEEPROM();
+    sendAckPrefix(id, cmd);
+    Serial.println(F("{\"saved\":true}}"));
+    return;
+  }
+
+  if (strcmp(cmd, "cal_start") == 0) {
+    if (armed) { sendError(id, cmd, "ARMED", "Disarm before calibrating"); return; }
+    if (!mpuConnected) { sendError(id, cmd, "NO_MPU", "MPU6050 not detected"); return; }
+    const char* target = data["target"] | "gyro";
+    sendAckPrefix(id, cmd);
+    Serial.println(F("{\"started\":true}}"));
+    runCalibration(target);
+    return;
+  }
+
+  if (strcmp(cmd, "motor_test") == 0) {
+    if (armed) { sendError(id, cmd, "ARMED", "Cannot test motors while armed"); return; }
+    if (!(data["confirm"] | false)) { sendError(id, cmd, "NO_CONFIRM", "Confirmation required"); return; }
+    int m = data["motor"] | 0;
+    int pwm = data["pwm"] | 1000;
+    if (m < 1 || m > 4) { sendError(id, cmd, "BAD_MOTOR", "Motor must be 1..4"); return; }
+    if (pwm < cfg.motorMinUs || pwm > cfg.motorTestMaxUs) {
+      sendError(id, cmd, "PWM_LIMIT", "PWM exceeds safe motor test cap");
+      return;
+    }
+    motorTestActive = true;
+    motorTestIdx = m - 1;
+    motorTestPwm = pwm;
+    motorTestDeadlineMs = millis() + MOTOR_TEST_WD_MS;
+    sendAckPrefix(id, cmd);
+    Serial.print(F("{\"motor\":")); Serial.print(m);
+    Serial.print(F(",\"pwm\":")); Serial.print(pwm);
+    Serial.println(F("}}"));
+    return;
+  }
+
+  if (strcmp(cmd, "motor_stop") == 0) {
+    stopAllMotors();
+    sendAckPrefix(id, cmd);
+    Serial.println(F("{\"stopped\":true}}"));
+    return;
+  }
+
+  if (strcmp(cmd, "set_motor_cfg") == 0) {
+    cfg.motorMinUs = constrain((int)(data["min_us"] | cfg.motorMinUs), 900, 1200);
+    cfg.motorIdleUs = constrain((int)(data["idle_us"] | cfg.motorIdleUs), 1000, 1300);
+    cfg.motorMaxUs = constrain((int)(data["max_us"] | cfg.motorMaxUs), 1700, 2100);
+    cfg.motorTestMaxUs = constrain((int)(data["test_max_us"] | cfg.motorTestMaxUs), cfg.motorMinUs, 1400);
+    sendAckPrefix(id, cmd);
+    Serial.print(F("{\"motor\":{\"min_us\":")); Serial.print(cfg.motorMinUs);
+    Serial.print(F(",\"idle_us\":")); Serial.print(cfg.motorIdleUs);
+    Serial.print(F(",\"max_us\":")); Serial.print(cfg.motorMaxUs);
+    Serial.print(F(",\"test_max_us\":")); Serial.print(cfg.motorTestMaxUs);
+    Serial.println(F("}}}"));
+    return;
+  }
+
+  if (strcmp(cmd, "set_radio_cfg") == 0) {
+    cfg.radioTimeoutMs = constrain((int)(data["timeout_ms"] | cfg.radioTimeoutMs), 100, 5000);
+    sendAckPrefix(id, cmd);
+    Serial.print(F("{\"timeout_ms\":")); Serial.print(cfg.radioTimeoutMs);
+    Serial.println(F("}}"));
+    return;
+  }
+
+  if (strcmp(cmd, "set_stream") == 0) {
+    streamEnabled = data["enabled"] | true;
+    int rate = constrain((int)(data["rate_hz"] | 20), 5, 50);
+    streamIntervalMs = 1000 / rate;
+    sendAckPrefix(id, cmd);
+    Serial.print(F("{\"rate_hz\":")); Serial.print(rate);
+    Serial.println(F("}}"));
+    return;
+  }
+
+  sendError(id, cmd, "UNKNOWN_CMD", "Unsupported command");
+}
+
+void sendTelemetry() {
+  Serial.print(F("{\"type\":\"telemetry\",\"status\":{\"armed\":"));
+  Serial.print(armed ? F("true") : F("false"));
+  Serial.print(F(",\"mode\":\"")); Serial.print(cfg.angleLoopEnabled ? F("STABILIZE") : F("ACRO"));
+  Serial.print(F("\",\"rx\":")); Serial.print(rxConnected ? F("true") : F("false"));
+  Serial.print(F(",\"mpu\":")); Serial.print(mpuConnected ? F("true") : F("false"));
+#ifdef ENABLE_VBAT_MONITOR
+  Serial.print(F(",\"bat_v\":")); Serial.print(analogRead(PIN_VBAT) * VBAT_SCALE, 2);
+#endif
+  Serial.print(F(",\"hz\":")); Serial.print(loopHz);
+  Serial.print(F(",\"ram\":")); Serial.print(freeRamBytes());
+
+  Serial.print(F("},\"imu\":{\"ax\":")); Serial.print(ax, 3);
+  Serial.print(F(",\"ay\":")); Serial.print(ay, 3);
+  Serial.print(F(",\"az\":")); Serial.print(az, 3);
+  Serial.print(F(",\"gx\":")); Serial.print(gx, 2);
+  Serial.print(F(",\"gy\":")); Serial.print(gy, 2);
+  Serial.print(F(",\"gz\":")); Serial.print(gz, 2);
+  Serial.print(F(",\"roll\":")); Serial.print(rollDeg, 2);
+  Serial.print(F(",\"pitch\":")); Serial.print(pitchDeg, 2);
+  Serial.print(F(",\"yaw_rate\":")); Serial.print(gz, 2);
+  Serial.print(F(",\"temp\":")); Serial.print(imuTempC, 1);
+  Serial.print(F(",\"mpu\":")); Serial.print(mpuConnected ? F("true") : F("false"));
+  Serial.print(F(",\"gcal\":")); Serial.print(cfg.gyroCalibrated ? F("true") : F("false"));
+  Serial.print(F(",\"acal\":")); Serial.print(cfg.accelCalibrated ? F("true") : F("false"));
+  Serial.print(F(",\"ts\":")); Serial.print(millis());
+
+  Serial.print(F("},\"rx\":{\"roll\":")); Serial.print(rxRoll);
+  Serial.print(F(",\"pitch\":")); Serial.print(rxPitch);
+  Serial.print(F(",\"thr\":")); Serial.print(rxThr);
+  Serial.print(F(",\"yaw\":")); Serial.print(rxYaw);
+  Serial.print(F(",\"rx\":")); Serial.print(rxConnected ? F("true") : F("false"));
+  Serial.print(F(",\"age_ms\":")); Serial.print(millis() - lastRxPacketMs);
+
+  Serial.print(F("},\"motors\":{\"m\":["));
+  for (int i = 0; i < 4; i++) {
+    if (i > 0) Serial.print(',');
+    Serial.print(motorOutUs[i]);
+  }
+  Serial.print(F("],\"test\":"));
+  Serial.print(motorTestActive ? F("true") : F("false"));
+  if (motorTestActive) {
+    Serial.print(F(",\"test_m\":")); Serial.print(motorTestIdx + 1);
+  }
+  Serial.println(F("}}"));
+}
+
+void setup() {
+  Serial.begin(SERIAL_BAUD);
+  pinMode(PIN_STATUS_LED, OUTPUT);
+  Wire.begin();
+  Wire.setClock(400000);
+  Wire.setWireTimeout(3000, true); // Prevent I2C hang if MPU6050 is disconnected
+
+  loadConfigEEPROM();
+
+  esc[0].attach(PIN_MOTOR_1, MOTOR_HARD_MIN_US, MOTOR_HARD_MAX_US);
+  esc[1].attach(PIN_MOTOR_2, MOTOR_HARD_MIN_US, MOTOR_HARD_MAX_US);
+  esc[2].attach(PIN_MOTOR_3, MOTOR_HARD_MIN_US, MOTOR_HARD_MAX_US);
+  esc[3].attach(PIN_MOTOR_4, MOTOR_HARD_MIN_US, MOTOR_HARD_MAX_US);
+  stopAllMotors();
+
+  mpuConnected = initMPU6050();
+
+#ifdef ENABLE_NRF24
+  radio.begin();
+  radio.setPALevel(RF24_PA_LOW);
+  radio.setDataRate(RF24_250KBPS);
+  radio.openReadingPipe(1, RX_ADDR);
+  radio.startListening();
+#endif
+
+  lastLoopUs = micros();
+}
+
+void loop() {
+  unsigned long nowUs = micros();
+  float dt = (nowUs - lastLoopUs) / 1000000.0f;
+  if (dt <= 0.0f || dt > 0.1f) dt = 0.004f;
+  lastLoopUs = nowUs;
+
+  mpuConnected = readMPU6050(dt);
+
+#ifdef ENABLE_NRF24
+  if (radio.available()) {
+    JoystickData pkt;
+    radio.read(&pkt, sizeof(pkt));
+    rxRoll  = constrain(map((long)pkt.x, 0, 1023, 1000, 2000), 1000, 2000);
+    rxThr   = constrain(map((long)pkt.y, 0, 1023, 1000, 2000), 1000, 2000);
+    rxPitch = 1500;
+    rxYaw   = 1500;
+    lastRxPacketMs = millis();
+    rxConnected = true;
+  } else if (millis() - lastRxPacketMs > cfg.radioTimeoutMs) {
+    rxConnected = false;
+    rxThr = 1000;
+  }
+#endif
+
+  if (motorTestActive && !armed) {
+    if (millis() > motorTestDeadlineMs) {
+      stopAllMotors();
+    } else {
+      for (int i = 0; i < 4; i++) {
+        motorOutUs[i] = (i == motorTestIdx) ? motorTestPwm : cfg.motorMinUs;
+        esc[i].writeMicroseconds(motorOutUs[i]);
+      }
+    }
+  } else if (!armed) {
+    stopAllMotors();
+  }
+
+  while (Serial.available() > 0) {
+    char c = (char)Serial.read();
+    if (c == '\n') {
+      rxBuf[rxPos] = '\0';
+      if (rxPos > 0) handleJsonCommand(rxBuf);
+      rxPos = 0;
+    } else if (c != '\r' && rxPos < sizeof(rxBuf) - 1) {
+      rxBuf[rxPos++] = c;
+    }
+  }
+
+  if (streamEnabled && (millis() - lastTelemetryMs >= streamIntervalMs)) {
+    lastTelemetryMs = millis();
+    sendTelemetry();
+    digitalWrite(PIN_STATUS_LED, !digitalRead(PIN_STATUS_LED));
+  }
+}

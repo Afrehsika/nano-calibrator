@@ -530,8 +530,11 @@ void setup() {
 
 #ifdef ENABLE_NRF24
   radio.begin();
+  radio.setChannel(76);
   radio.setPALevel(RF24_PA_LOW);
   radio.setDataRate(RF24_250KBPS);
+  radio.setAutoAck(true);
+  radio.setPayloadSize(sizeof(JoystickData));
   radio.openReadingPipe(1, RX_ADDR);
   radio.startListening();
 #endif
@@ -555,7 +558,7 @@ void loop() {
   }
 
 #ifdef ENABLE_NRF24
-  if (radio.available()) {
+  while (radio.available()) {
     JoystickData pkt;
     radio.read(&pkt, sizeof(pkt));
     rxThr   = constrain(map((long)pkt.throttle, 0, 1023, 1000, 2000), 1000, 2000);
@@ -564,7 +567,8 @@ void loop() {
     rxPitch = constrain(map((long)pkt.pitch,    0, 1023, 1000, 2000), 1000, 2000);
     lastRxPacketMs = millis();
     rxConnected = true;
-  } else if (millis() - lastRxPacketMs > cfg.radioTimeoutMs) {
+  }
+  if (millis() - lastRxPacketMs > cfg.radioTimeoutMs) {
     rxConnected = false;
     rxThr = 1000;
   }

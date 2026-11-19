@@ -651,7 +651,13 @@ void loop() {
         armed = false;
         resetPIDState();
         stopAllMotors();
-      } else if (rxThr < 1060 && mpuConnected && !motorTestActive) {
+      } else if (rxThr >= 1060) {
+        sendError(-1, "arm", F("THR_HIGH"), F("Pull throttle below 1060 us to arm"));
+      } else if (!mpuConnected) {
+        sendError(-1, "arm", F("NO_MPU"), F("MPU6050 not detected"));
+      } else if (motorTestActive) {
+        sendError(-1, "arm", F("MOTOR_TEST"), F("Stop motor test before arming"));
+      } else {
         resetPIDState();
         armed = true;
       }

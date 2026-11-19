@@ -95,6 +95,8 @@ void loop() {
     Serial.print(F(" YAW:")); Serial.print(map(data.yaw, 0, 1023, 1000, 2000));
     Serial.print(F(" ROL:")); Serial.print(map(data.roll, 0, 1023, 1000, 2000));
     Serial.print(F(" PIT:")); Serial.print(map(data.pitch, 0, 1023, 1000, 2000));
+    Serial.print(F(" | D2:")); Serial.print(data.btn1 ? F("PRESSED") : F("OFF"));
+    Serial.print(F(" D3:")); Serial.print(data.btn2 ? F("PRESSED") : F("OFF"));
     Serial.println(success ? F(" | TX OK") : F(" | TX FAILED"));
   }
 }

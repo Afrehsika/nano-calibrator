@@ -77,9 +77,20 @@ float rollDeg = 0.0f, pitchDeg = 0.0f;
 // Radio state
 uint16_t rxRoll = 1500, rxPitch = 1500, rxThr = 1000, rxYaw = 1500;
 unsigned long lastRxPacketMs = 0;
+uint8_t prevArmBtn = 0;
+unsigned long lastArmToggleMs = 0;
+
+// PID controller state
+float iRoll = 0, iPitch = 0, iYaw = 0;
+float prevErrRoll = 0, prevErrPitch = 0, prevErrYaw = 0;
+
+void resetPIDState() {
+  iRoll = iPitch = iYaw = 0.0f;
+  prevErrRoll = prevErrPitch = prevErrYaw = 0.0f;
+}
 
 // Serial line buffer (fixed-size to avoid SRAM fragmentation)
-char rxBuf[320];
+char rxBuf[280];
 uint16_t rxPos = 0;
 bool rxLineReady = false;
 
@@ -218,7 +229,7 @@ void printPIDObject() {
   Serial.print(F("}}"));
 }
 
-void sendError(long id, const char* cmd, const char* code, const char* msg) {
+void sendError(long id, const char* cmd, const __FlashStringHelper* code, const __FlashStringHelper* msg) {
   Serial.print(F("{\"type\":\"err\""));
   if (id >= 0) { Serial.print(F(",\"id\":")); Serial.print(id); }
   Serial.print(F(",\"cmd\":\"")); Serial.print(cmd);
@@ -327,7 +338,7 @@ void parseAxisPID(const char* block, const char* axisKey, AxisPID& target) {
 void handleJsonCommand(const char* line) {
   char cmd[24] = "";
   if (!jsonGetStr(line, "cmd", cmd, sizeof(cmd))) {
-    sendError(-1, "", "BAD_JSON", "Missing cmd");
+    sendError(-1, "", F("BAD_JSON"), F("Missing cmd"));
     return;
   }
   long id = jsonGetLong(line, "id", -1L);
@@ -395,8 +406,8 @@ void handleJsonCommand(const char* line) {
   }
 
   if (strcmp(cmd, "cal_start") == 0) {
-    if (armed) { sendError(id, cmd, "ARMED", "Disarm before calibrating"); return; }
-    if (!mpuConnected) { sendError(id, cmd, "NO_MPU", "MPU6050 not detected"); return; }
+    if (armed) { sendError(id, cmd, F("ARMED"), F("Disarm before calibrating")); return; }
+    if (!mpuConnected) { sendError(id, cmd, F("NO_MPU"), F("MPU6050 not detected")); return; }
     char target[12] = "gyro";
     jsonGetStr(data, "target", target, sizeof(target));
     sendAckPrefix(id, cmd);
@@ -406,13 +417,13 @@ void handleJsonCommand(const char* line) {
   }
 
   if (strcmp(cmd, "motor_test") == 0) {
-    if (armed) { sendError(id, cmd, "ARMED", "Cannot test motors while armed"); return; }
-    if (!jsonGetBool(data, "confirm", false)) { sendError(id, cmd, "NO_CONFIRM", "Confirmation required"); return; }
+    if (armed) { sendError(id, cmd, F("ARMED"), F("Cannot test motors while armed")); return; }
+    if (!jsonGetBool(data, "confirm", false)) { sendError(id, cmd, F("NO_CONFIRM"), F("Confirmation required")); return; }
     int m = (int)jsonGetLong(data, "motor", 0);
     int pwm = (int)jsonGetLong(data, "pwm", 1000);
-    if (m < 1 || m > 4) { sendError(id, cmd, "BAD_MOTOR", "Motor must be 1..4"); return; }
+    if (m < 1 || m > 4) { sendError(id, cmd, F("BAD_MOTOR"), F("Motor must be 1..4")); return; }
     if (pwm < cfg.motorMinUs || pwm > cfg.motorTestMaxUs) {
-      sendError(id, cmd, "PWM_LIMIT", "PWM exceeds safe motor test cap");
+      sendError(id, cmd, F("PWM_LIMIT"), F("PWM exceeds safe motor test cap"));
       return;
     }
     motorTestActive = true;
@@ -465,7 +476,7 @@ void handleJsonCommand(const char* line) {
     return;
   }
 
-  sendError(id, cmd, "UNKNOWN_CMD", "Unsupported command");
+  sendError(id, cmd, F("UNKNOWN_CMD"), F("Unsupported command"));
 }
 
 void sendTelemetry() {
@@ -543,7 +554,6 @@ void setup() {
   radio.setPALevel(RF24_PA_LOW);
   radio.setDataRate(RF24_250KBPS);
   radio.setAutoAck(true);
-  radio.setPayloadSize(sizeof(JoystickData));
   radio.openReadingPipe(1, RX_ADDR);
   radio.startListening();
 #endif
@@ -552,6 +562,63 @@ void setup() {
 }
 
 unsigned long lastMpuRetryMs = 0;
+
+float applyDeadband(int16_t delta, int16_t db) {
+  if (abs(delta) <= db) return 0.0f;
+  return (float)(delta > 0 ? delta - db : delta + db);
+}
+
+void runFlightMixer(float dt) {
+  if (rxThr < 1060) {
+    resetPIDState();
+    for (int i = 0; i < 4; i++) setMotorUs(i, cfg.motorIdleUs);
+    return;
+  }
+
+  float rollStick  = applyDeadband((int16_t)rxRoll - 1500, 10) / 500.0f;
+  float pitchStick = applyDeadband((int16_t)rxPitch - 1500, 10) / 500.0f;
+  float yawStick   = applyDeadband((int16_t)rxYaw - 1500, 10) / 500.0f;
+
+  float targetRateRoll, targetRatePitch;
+  if (cfg.angleLoopEnabled) {
+    float targetAngleRoll  = rollStick * 30.0f;   // +/- 30 deg max
+    float targetAnglePitch = pitchStick * 30.0f;
+    targetRateRoll  = (targetAngleRoll  - rollDeg)  * cfg.angleRoll.p;
+    targetRatePitch = (targetAnglePitch - pitchDeg) * cfg.anglePitch.p;
+  } else {
+    targetRateRoll  = rollStick * 200.0f;         // +/- 200 deg/s in ACRO
+    targetRatePitch = pitchStick * 200.0f;
+  }
+  float targetRateYaw = yawStick * 180.0f;
+
+  float errRoll  = targetRateRoll  - gx;
+  float errPitch = targetRatePitch - gy;
+  float errYaw   = targetRateYaw   - gz;
+
+  iRoll  = constrain(iRoll  + errRoll  * cfg.rateRoll.i  * dt, -150.0f, 150.0f);
+  iPitch = constrain(iPitch + errPitch * cfg.ratePitch.i * dt, -150.0f, 150.0f);
+  iYaw   = constrain(iYaw   + errYaw   * cfg.rateYaw.i   * dt, -150.0f, 150.0f);
+
+  float dRoll  = ((errRoll  - prevErrRoll)  / dt) * (cfg.rateRoll.d  * 0.01f);
+  float dPitch = ((errPitch - prevErrPitch) / dt) * (cfg.ratePitch.d * 0.01f);
+  float dYaw   = ((errYaw   - prevErrYaw)   / dt) * (cfg.rateYaw.d   * 0.01f);
+  prevErrRoll = errRoll; prevErrPitch = errPitch; prevErrYaw = errYaw;
+
+  float outRoll  = constrain(errRoll  * cfg.rateRoll.p  + iRoll  + dRoll,  -350.0f, 350.0f);
+  float outPitch = constrain(errPitch * cfg.ratePitch.p + iPitch + dPitch, -350.0f, 350.0f);
+  float outYaw   = constrain(errYaw   * cfg.rateYaw.p   + iYaw   + dYaw,   -350.0f, 350.0f);
+
+  // Quad-X Mixer: M1=FL(CW), M2=FR(CCW), M3=RR(CW), M4=RL(CCW)
+  int m1 = constrain((int)(rxThr + outRoll + outPitch - outYaw), cfg.motorIdleUs, cfg.motorMaxUs);
+  int m2 = constrain((int)(rxThr - outRoll + outPitch + outYaw), cfg.motorIdleUs, cfg.motorMaxUs);
+  int m3 = constrain((int)(rxThr - outRoll - outPitch - outYaw), cfg.motorIdleUs, cfg.motorMaxUs);
+  int m4 = constrain((int)(rxThr + outRoll - outPitch + outYaw), cfg.motorIdleUs, cfg.motorMaxUs);
+
+  setMotorUs(0, (uint16_t)m1);
+  setMotorUs(1, (uint16_t)m2);
+  setMotorUs(2, (uint16_t)m3);
+  setMotorUs(3, (uint16_t)m4);
+}
 
 void loop() {
   unsigned long nowUs = micros();
@@ -576,14 +643,35 @@ void loop() {
     rxPitch = constrain(map((long)pkt.pitch,    0, 1023, 1000, 2000), 1000, 2000);
     lastRxPacketMs = millis();
     rxConnected = true;
+
+    // Toggle Arm/Disarm on Left Stick button (btn1 on D2) rising edge
+    if (pkt.btn1 == 1 && prevArmBtn == 0 && (millis() - lastArmToggleMs > 300)) {
+      lastArmToggleMs = millis();
+      if (armed) {
+        armed = false;
+        resetPIDState();
+        stopAllMotors();
+      } else if (rxThr < 1060 && mpuConnected && !motorTestActive) {
+        resetPIDState();
+        armed = true;
+      }
+    }
+    prevArmBtn = pkt.btn1;
   }
   if (millis() - lastRxPacketMs > cfg.radioTimeoutMs) {
     rxConnected = false;
     rxThr = 1000;
+    if (armed) {
+      armed = false;
+      resetPIDState();
+      stopAllMotors();
+    }
   }
 #endif
 
-  if (motorTestActive && !armed) {
+  if (armed) {
+    runFlightMixer(dt);
+  } else if (motorTestActive) {
     if (millis() > motorTestDeadlineMs) {
       stopAllMotors();
     } else {
@@ -591,7 +679,7 @@ void loop() {
         setMotorUs(i, (i == motorTestIdx) ? motorTestPwm : cfg.motorMinUs);
       }
     }
-  } else if (!armed) {
+  } else {
     stopAllMotors();
   }
 

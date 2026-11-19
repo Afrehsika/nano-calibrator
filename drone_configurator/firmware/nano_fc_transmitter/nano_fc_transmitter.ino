@@ -70,7 +70,6 @@ void setup() {
   radio.setPALevel(RF24_PA_LOW);
   radio.setDataRate(RF24_250KBPS);
   radio.setAutoAck(true);
-  radio.setPayloadSize(sizeof(JoystickData));
   radio.setRetries(5, 15);
   radio.openWritingPipe(address);
   radio.stopListening();

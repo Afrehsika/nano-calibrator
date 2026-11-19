@@ -124,7 +124,7 @@ void loadDefaultConfig() {
   cfg.anglePitch = {4.50f, 0.00f, 0.0f};
   cfg.angleYaw   = {0.00f, 0.00f, 0.0f};
   cfg.motorMinUs = 1000;
-  cfg.motorIdleUs = 1080;
+  cfg.motorIdleUs = 1180;
   cfg.motorMaxUs = 2000;
   cfg.motorTestMaxUs = MOTOR_TEST_CAP_US;
   cfg.radioTimeoutMs = 500;
@@ -171,6 +171,9 @@ bool initMPU6050() {
   Wire.write(0x00);
   if (Wire.endTransmission() != 0) return false;
 
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(0x1A); Wire.write(0x03); // Hardware DLPF ~42 Hz to reject motor vibration
+  Wire.endTransmission();
   Wire.beginTransmission(MPU6050_ADDR);
   Wire.write(0x1B); Wire.write(0x08);
   Wire.endTransmission();
@@ -449,6 +452,7 @@ void handleJsonCommand(const char* line) {
     cfg.motorIdleUs = constrain((int)jsonGetLong(data, "idle_us", cfg.motorIdleUs), 1000, 1300);
     cfg.motorMaxUs = constrain((int)jsonGetLong(data, "max_us", cfg.motorMaxUs), 1700, 2100);
     cfg.motorTestMaxUs = constrain((int)jsonGetLong(data, "test_max_us", cfg.motorTestMaxUs), cfg.motorMinUs, 1400);
+    saveConfigEEPROM();
     sendAckPrefix(id, cmd);
     Serial.print(F("{\"motor\":{\"min_us\":")); Serial.print(cfg.motorMinUs);
     Serial.print(F(",\"idle_us\":")); Serial.print(cfg.motorIdleUs);
@@ -575,9 +579,9 @@ void runFlightMixer(float dt) {
     return;
   }
 
-  float rollStick  = applyDeadband((int16_t)rxRoll - 1500, 10) / 500.0f;
-  float pitchStick = applyDeadband((int16_t)rxPitch - 1500, 10) / 500.0f;
-  float yawStick   = applyDeadband((int16_t)rxYaw - 1500, 10) / 500.0f;
+  float rollStick  = applyDeadband((int16_t)rxRoll - 1500, 25) / 500.0f;
+  float pitchStick = applyDeadband((int16_t)rxPitch - 1500, 25) / 500.0f;
+  float yawStick   = applyDeadband((int16_t)rxYaw - 1500, 25) / 500.0f;
 
   float targetRateRoll, targetRatePitch;
   if (cfg.angleLoopEnabled) {
@@ -595,13 +599,17 @@ void runFlightMixer(float dt) {
   float errPitch = targetRatePitch - gy;
   float errYaw   = targetRateYaw   - gz;
 
-  iRoll  = constrain(iRoll  + errRoll  * cfg.rateRoll.i  * dt, -150.0f, 150.0f);
-  iPitch = constrain(iPitch + errPitch * cfg.ratePitch.i * dt, -150.0f, 150.0f);
-  iYaw   = constrain(iYaw   + errYaw   * cfg.rateYaw.i   * dt, -150.0f, 150.0f);
+  if (rxThr >= 1150) {
+    iRoll  = constrain(iRoll  + errRoll  * cfg.rateRoll.i  * dt, -80.0f, 80.0f);
+    iPitch = constrain(iPitch + errPitch * cfg.ratePitch.i * dt, -80.0f, 80.0f);
+    iYaw   = constrain(iYaw   + errYaw   * cfg.rateYaw.i   * dt, -80.0f, 80.0f);
+  } else {
+    resetPIDState();
+  }
 
-  float dRoll  = ((errRoll  - prevErrRoll)  / dt) * (cfg.rateRoll.d  * 0.01f);
-  float dPitch = ((errPitch - prevErrPitch) / dt) * (cfg.ratePitch.d * 0.01f);
-  float dYaw   = ((errYaw   - prevErrYaw)   / dt) * (cfg.rateYaw.d   * 0.01f);
+  float dRoll  = ((errRoll  - prevErrRoll)  / dt) * (cfg.rateRoll.d  * 0.001f);
+  float dPitch = ((errPitch - prevErrPitch) / dt) * (cfg.ratePitch.d * 0.001f);
+  float dYaw   = ((errYaw   - prevErrYaw)   / dt) * (cfg.rateYaw.d   * 0.001f);
   prevErrRoll = errRoll; prevErrPitch = errPitch; prevErrYaw = errYaw;
 
   float outRoll  = constrain(errRoll  * cfg.rateRoll.p  + iRoll  + dRoll,  -350.0f, 350.0f);
@@ -644,8 +652,9 @@ void loop() {
     lastRxPacketMs = millis();
     rxConnected = true;
 
-    // Toggle Arm/Disarm on Left Stick button (btn1 on D2) rising edge
-    if (pkt.btn1 == 1 && prevArmBtn == 0 && (millis() - lastArmToggleMs > 300)) {
+    // Toggle Arm/Disarm on either stick button (btn1 on D2 or btn2 on D3) rising edge
+    uint8_t armBtn = (pkt.btn1 || pkt.btn2) ? 1 : 0;
+    if (armBtn == 1 && prevArmBtn == 0 && (millis() - lastArmToggleMs > 300)) {
       lastArmToggleMs = millis();
       if (armed) {
         armed = false;
@@ -662,7 +671,7 @@ void loop() {
         armed = true;
       }
     }
-    prevArmBtn = pkt.btn1;
+    prevArmBtn = armBtn;
   }
   if (millis() - lastRxPacketMs > cfg.radioTimeoutMs) {
     rxConnected = false;

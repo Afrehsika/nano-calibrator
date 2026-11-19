@@ -140,11 +140,17 @@ void loadConfigEEPROM() {
   }
 }
 
+void setMotorUs(uint8_t idx, uint16_t pwm) {
+  if (motorOutUs[idx] != pwm) {
+    motorOutUs[idx] = pwm;
+    esc[idx].writeMicroseconds(pwm);
+  }
+}
+
 void stopAllMotors() {
   motorTestActive = false;
   for (int i = 0; i < 4; i++) {
-    motorOutUs[i] = cfg.motorMinUs;
-    esc[i].writeMicroseconds(cfg.motorMinUs);
+    setMotorUs(i, cfg.motorMinUs);
   }
 }
 
@@ -524,7 +530,10 @@ void setup() {
   esc[1].attach(PIN_MOTOR_2, MOTOR_HARD_MIN_US, MOTOR_HARD_MAX_US);
   esc[2].attach(PIN_MOTOR_3, MOTOR_HARD_MIN_US, MOTOR_HARD_MAX_US);
   esc[3].attach(PIN_MOTOR_4, MOTOR_HARD_MIN_US, MOTOR_HARD_MAX_US);
-  stopAllMotors();
+  for (int i = 0; i < 4; i++) {
+    motorOutUs[i] = cfg.motorMinUs;
+    esc[i].writeMicroseconds(cfg.motorMinUs);
+  }
 
   mpuConnected = initMPU6050();
 
@@ -579,8 +588,7 @@ void loop() {
       stopAllMotors();
     } else {
       for (int i = 0; i < 4; i++) {
-        motorOutUs[i] = (i == motorTestIdx) ? motorTestPwm : cfg.motorMinUs;
-        esc[i].writeMicroseconds(motorOutUs[i]);
+        setMotorUs(i, (i == motorTestIdx) ? motorTestPwm : cfg.motorMinUs);
       }
     }
   } else if (!armed) {
